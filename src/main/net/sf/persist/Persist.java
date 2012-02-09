@@ -8,6 +8,7 @@ import java.math.BigDecimal;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.ParameterMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -64,8 +65,11 @@ public final class Persist {
 
 	private static ConcurrentMap<String, ConcurrentMap<Class, Mapping>> mappingCaches = new ConcurrentHashMap();
 	private static ConcurrentMap<String, NameGuesser> nameGuessers = new ConcurrentHashMap();
+   private static ConcurrentMap<Integer, String> typeNameMap = new ConcurrentHashMap();
+   private static ConcurrentMap<Class, Integer> typeClassMap = new ConcurrentHashMap();
 
 	private static final String DEFAULT_CACHE = "default cache";
+    private static final boolean USE_GUESSED_NAMES = true;
 
 	private String cacheName = DEFAULT_CACHE;
 	private NameGuesser nameGuesser = null;
@@ -108,6 +112,9 @@ public final class Persist {
 
 		this.cacheName = cacheName;
 		this.connection = connection;
+
+      buildSQLTypeNameMap( connection );
+      buildJavaClassTypeMap();
 
 		this.nameGuesser = nameGuessers.get(cacheName);
 		if (this.nameGuesser == null) {
@@ -187,6 +194,28 @@ public final class Persist {
 	 * @since 1.0
 	 */
 	public Mapping getMapping(final Class objectClass) {
+      return getMapping( objectClass, null, false );
+   }
+   
+   /**
+	 * Returns the mapping for the given object class.
+	 * 
+	 * @param tableName Override the default table name.
+	 */
+   public Mapping getMapping(final Class objectClass, final String tableName ) {
+      return getMapping( objectClass, tableName, false );
+   }
+
+   /**
+	 * Returns the mapping for the given object class.
+	 *
+	 * @param tableName Override the default table name.  Can be null.
+    * @param useGuessedNames Use the guessed names for creating the table.  This should only be necessary when getting
+    *                        the mapping for objects which aren't yet in the cache.
+	 */
+   public Mapping getMapping(final Class objectClass, final String tableName, final boolean useGuessedNames ) {
+
+//        System.out.println( "Persist: getting mapping for [" + objectClass.getName() + "] objects from table [" + tableName + "]" );
 
 		if (cacheName == null) {
 			cacheName = DEFAULT_CACHE;
@@ -203,9 +232,9 @@ public final class Persist {
 		if (!mappingCache.containsKey(objectClass)) {
 			try {
 				// more than one map may end up being inserted here for the same
-				// objectClass, but this is not
-				// problematic
-				mappingCache.put(objectClass, Mapping.getMapping(connection.getMetaData(), objectClass, nameGuesser));
+				// objectClass, but this is not problematic
+            mappingCache.put( objectClass, Mapping.getMapping( connection.getMetaData(), objectClass, nameGuesser, 
+                                                               tableName, useGuessedNames ));
 
 				if (Log.isDebugEnabled(Log.ENGINE)) {
 					Log.debug(Log.ENGINE, "Cached mapping for [" + objectClass.getCanonicalName() + "]");
@@ -218,13 +247,22 @@ public final class Persist {
 		return mappingCache.get(objectClass);
 	}
 
+   private TableMapping getTableMapping(Class objectClass, String callingMethodName) {
+      return getTableMapping( objectClass, null, callingMethodName );
+   }
+
+   private TableMapping getTableMapping(Class objectClass, String tableName, String callingMethodName) {
+      return getTableMapping( objectClass, tableName, false, callingMethodName );
+   }
+   
 	/**
 	 * Utility method that will get a TableMapping for a given class. If the
 	 * mapping for the class is not a TableMapping, will throw an exception
 	 * specifying the given calling method name.
 	 */
-	private TableMapping getTableMapping(Class objectClass, String callingMethodName) {
-		final Mapping mapping = getMapping(objectClass);
+	private TableMapping getTableMapping(Class objectClass, String tableName, boolean useGuessedNames,
+                                        String callingMethodName) {
+		final Mapping mapping = getMapping(objectClass, tableName, useGuessedNames);
 		if (!(mapping instanceof TableMapping)) {
 			throw new PersistException("Class [" + objectClass.getCanonicalName()
 					+ "] has a @NoTable annotation defined, therefore " + callingMethodName + " can't work with it. "
@@ -631,6 +669,14 @@ public final class Persist {
 		}
 	}
 
+    /**
+     * @eturns true if the Class type parameter is known and supported by Persist
+     * @deprecated this method shouldn't be used because this method of handling support for data types isn't yet supported
+     */
+    @Deprecated
+	static boolean isSupportedType(final Class type) {
+       return getClassToTypeNumMap().containsKey( type );
+    }
 	/**
 	 * Returns true if the provided class is a type supported natively (as
 	 * opposed to a bean).
@@ -638,7 +684,7 @@ public final class Persist {
 	 * @param type {@link java.lang.Class} type to be tested
 	 * @since 1.0
 	 */
-	private static boolean isNativeType(final Class type) {
+	static boolean isNativeType(final Class type) {
 
 		// to return an arbitrary object use Object.class
 
@@ -824,7 +870,7 @@ public final class Persist {
 	 * <li> VARBINARY: getBytes
 	 * <li> VARCHAR: getString
 	 * <li> [Oracle specific] 100: getFloat
-	 * <li> [Oracle specific] 101: getDouble
+	 * <li> [Oracle specifiVARc] 101: getDouble
 	 * </ul>
 	 * <p>
 	 * null's are respected for all types. This means that if a column is of
@@ -996,7 +1042,7 @@ public final class Persist {
 			try {
 				ret = objectClass.newInstance();
 			} catch (Exception e) {
-				throw new PersistException(e);
+				throw new PersistException(e.getMessage() + " -- please ensure that this class has a zero argument constructor");
 			}
 
 			for (int i = 1; i <= resultSetMetaData.getColumnCount(); i++) {
@@ -1082,6 +1128,11 @@ public final class Persist {
 
 	// ---------- execute ----------
 
+   public Result executeUpdate(final Class objectClass, final String sql, final String[] autoGeneratedKeys,
+			final Object...parameters) {
+      return executeUpdate( objectClass, null, sql, autoGeneratedKeys, parameters );
+   }
+
 	/**
 	 * Executes an update and return a {@link Result} object containing the
 	 * number of rows modified and auto-generated keys produced.
@@ -1098,8 +1149,8 @@ public final class Persist {
 	 * @param parameters Parameters to be used in the PreparedStatement.
 	 * @since 1.0
 	 */
-	public Result executeUpdate(final Class objectClass, final String sql, final String[] autoGeneratedKeys,
-			final Object...parameters) {
+	public Result executeUpdate(final Class objectClass, final String tableName, final String sql,
+                               final String[] autoGeneratedKeys, final Object...parameters) {
 
 		long begin = 0;
 		if (Log.isDebugEnabled(Log.PROFILING)) {
@@ -1158,13 +1209,15 @@ public final class Persist {
 	}
 
 	/**
-	 * Executes an update and returns the number of rows modified.
+	 * Executes an update and returns the number of rows modified.  Does not accept an explicit table name
+    * because that would most likely be kept in the SQL used for the first parameter.
 	 * <p>
 	 * Parameters will be set according with the correspondence defined in
 	 * {@link #setParameters(PreparedStatement, int[], Object[])}
 	 * 
 	 * @param sql SQL code to be executed.
 	 * @param parameters Parameters to be used in the PreparedStatement.
+     * @return number of rows modified
 	 * @since 1.0
 	 */
 	public int executeUpdate(final String sql, final Object...parameters) {
@@ -1185,15 +1238,38 @@ public final class Persist {
 		return rowsModified;
 	}
 
+   // ---------- create ----------
+
+   // TODO add javadoc
+   public int create(final String tableName, final Object o) {
+
+      System.out.println( "Creating table [" + tableName + "] to hold objects of type [" + o.getClass().getName() + "]" );
+
+      final TableMapping mapping;
+      mapping = getTableMapping( o.getClass(), tableName, USE_GUESSED_NAMES, "create()" );
+
+      final String sql = mapping.getCreateSql();
+
+      int ret = executeUpdate(sql, (Object[]) null );
+
+      return ret;
+   }
+
+   // TODO add javadoc
+   public int create(final Object o) {
+      return create(null, o);
+   }
+
 	// ---------- insert ----------
 
 	/**
 	 * Inserts an object into the database.
-	 * 
+	 *
+     * @return number of rows modified (1, right?)
 	 * @since 1.0
 	 */
-	public int insert(final Object object) {
-		final TableMapping mapping = getTableMapping(object.getClass(), "insert()");
+	public int insert(final String tableName, final Object object) {
+		final TableMapping mapping = getTableMapping(object.getClass(), tableName, "insert()");
 		final String sql = mapping.getInsertSql();
 		final String[] columns = mapping.getNotAutoGeneratedColumns();
 		final Object[] parameters = getParametersFromObject(object, columns, mapping);
@@ -1201,7 +1277,7 @@ public final class Persist {
 		int ret = 0;
 		if (updateAutoGeneratedKeys) {
 			if (mapping.supportsGetGeneratedKeys()) {
-				final Result result = executeUpdate(object.getClass(), sql, mapping.getAutoGeneratedColumns(),
+				final Result result = executeUpdate(object.getClass(), tableName, sql, mapping.getAutoGeneratedColumns(),
 						parameters);
 				setAutoGeneratedKeys(object, result);
 				ret = result.getRowsModified();
@@ -1215,22 +1291,32 @@ public final class Persist {
 		return ret;
 	}
 
-	/**
+      // TODO add javadoc
+   public int insert(final Object object) {
+      return insert( null, object );
+   }
+
+   /**
 	 * Inserts a batch of objects into the database.
 	 * 
 	 * @since 1.0
 	 */
 	// TODO: use batch updates
-	public int[] insertBatch(final Object...objects) {
+	public int[] insertBatch(final String tableName, final Object...objects) {
 		if (objects == null || objects.length == 0) {
 			return new int[0];
 		}
 		final int[] results = new int[objects.length];
 		for (int i = 0; i < objects.length; i++) {
-			results[i] = insert(objects[i]);
+			results[i] = insert(tableName, objects[i]);
 		}
 		return results;
 	}
+
+      // TODO add javadoc
+   public int[] insertBatch(final Object...objects) {
+      return insertBatch(null, objects);
+   }
 
 	// ---------- update ----------
 
@@ -1241,8 +1327,8 @@ public final class Persist {
 	 * 
 	 * @since 1.0
 	 */
-	public int update(final Object object) {
-		final TableMapping mapping = getTableMapping(object.getClass(), "update()");
+	public int update(final String tableName, final Object object) {
+		final TableMapping mapping = getTableMapping(object.getClass(), tableName, "update()");
 
 		if (mapping.getPrimaryKeys().length == 0) {
 			throw new PersistException("Table " + mapping.getTableName() + " doesn't have a primary key");
@@ -1260,6 +1346,11 @@ public final class Persist {
 		return executeUpdate(sql, parameters);
 	}
 
+   // TODO add javadoc
+   public int update(final Object object) {
+      return update( null, object );
+   }
+
 	/**
 	 * Updates a batch of objects in the database. The objects will be
 	 * identified using their mapped table's primary keys. If no primary keys
@@ -1268,17 +1359,21 @@ public final class Persist {
 	 * 
 	 * @since 1.0
 	 */
-	public int[] updateBatch(final Object...objects) {
+	public int[] updateBatch(final String tableName, final Object...objects) {
 		// TODO: use batch updates
 		if (objects == null || objects.length == 0) {
 			return new int[0];
 		}
 		int[] results = new int[objects.length];
 		for (int i = 0; i < objects.length; i++) {
-			results[i] = update(objects[i]);
+			results[i] = update(tableName, objects[i]);
 		}
 		return results;
 	}
+
+   public int[] updateBatch(final Object...objects) {
+      return updateBatch( null, objects );
+   }
 
 	// ---------- delete ----------
 
@@ -1289,8 +1384,8 @@ public final class Persist {
 	 * 
 	 * @since 1.0
 	 */
-	public int delete(final Object object) {
-		final TableMapping mapping = getTableMapping(object.getClass(), "delete()");
+	public int delete(final String tableName, final Object object) {
+		final TableMapping mapping = getTableMapping(object.getClass(), tableName, "delete()");
 		if (mapping.getPrimaryKeys().length == 0) {
 			throw new PersistException("Table " + mapping.getTableName() + " doesn't have a primary key");
 		}
@@ -1300,6 +1395,10 @@ public final class Persist {
 		return executeUpdate(sql, parameters);
 	}
 
+   public int delete(final Object object) {
+      return delete( null, object );
+   }
+
 	/**
 	 * Updates a batch of objects in the database. The objects will be
 	 * identified using their matched table's primary keys. If no primary keys
@@ -1307,17 +1406,21 @@ public final class Persist {
 	 * 
 	 * @since 1.0
 	 */
-	public int[] deleteBatch(final Object...objects) {
+	public int[] deleteBatch(final String tableName, final Object...objects) {
 		// TODO: use batch updates
 		if (objects == null || objects.length == 0) {
 			return new int[0];
 		}
 		int[] results = new int[objects.length];
 		for (int i = 0; i < objects.length; i++) {
-			results[i] = delete(objects[i]);
+			results[i] = delete(tableName, objects[i]);
 		}
 		return results;
 	}
+
+   public int[] deleteBatch(final Object...objects) {
+      return deleteBatch(null, objects);
+   }
 
 	// ---------- read ----------
 
@@ -1422,11 +1525,15 @@ public final class Persist {
 	 * 
 	 * @since 1.0
 	 */
-	public <T> T readByPrimaryKey(final Class<T> objectClass, final Object...primaryKeyValues) {
-		final TableMapping mapping = getTableMapping(objectClass, "readByPrimaryKey()");
+	public <T> T readByPrimaryKey(final String tableName, final Class<T> objectClass, final Object...primaryKeyValues) {
+		final TableMapping mapping = getTableMapping(objectClass, tableName, "readByPrimaryKey()");
 		final String sql = mapping.getSelectSql();
 		return read(objectClass, sql, primaryKeyValues);
 	}
+
+   public <T> T readByPrimaryKey(final Class<T> objectClass, final Object...primaryKeyValues) {
+      return readByPrimaryKey( null, objectClass, primaryKeyValues );
+   }
 
 	// --- lists ---
 
@@ -1524,17 +1631,23 @@ public final class Persist {
 		return readList(objectClass, sql, (Object[]) null);
 	}
 
-	/**
+   /**
 	 * Reads a list of all objects in the database mapped to the given object
 	 * class.
 	 * 
 	 * @since 1.0
 	 */
-	public <T> List<T> readList(final Class<T> objectClass) {
-		final TableMapping mapping = getTableMapping(objectClass, "readList(Class)");
+	public <T> List<T> readList(final String tableName, final Class<T> objectClass) {
+       System.out.println( "Persist: reading [" + objectClass.getName() + "] objects from table [" + tableName + "]" );
+		final TableMapping mapping = getTableMapping(objectClass, tableName, "readList(Class)");
 		final String sql = mapping.getSelectAllSql();
+       System.out.println( "Persist: reading table with query: " + sql );
 		return readList(objectClass, sql);
 	}
+
+   public <T> List<T> readList(final Class<T> objectClass) {
+      return readList( null, objectClass );
+   }
 
 	// --- iterators ---
 
@@ -1630,11 +1743,15 @@ public final class Persist {
 	 * 
 	 * @since 1.0
 	 */
-	public <T> Iterator<T> readIterator(final Class<T> objectClass) {
-		final TableMapping mapping = getTableMapping(objectClass, "readIterator(Class)");
+	public <T> Iterator<T> readIterator(final String tableName, final Class<T> objectClass) {
+		final TableMapping mapping = getTableMapping(objectClass, tableName, "readIterator(Class)");
 		final String sql = mapping.getSelectAllSql();
 		return readIterator(objectClass, sql);
 	}
+
+   public <T> Iterator<T> readIterator ( final Class<T> objectClass ) {
+      return readIterator( null, objectClass );
+   }
 
 	// ---------- read (map) ----------
 
@@ -1923,5 +2040,147 @@ public final class Persist {
 	public Iterator readMapIterator(final String sql) {
 		return readMapIterator(sql, (Object[]) null);
 	}
+
+   /**
+    * Populates the ConcurrentMap which correlates the data types from java.sql.Types to
+    * the String based name which the current DBMS recognizes.  This method retrieves this mapping
+    * information from a DatabaseMetaData object, so only supported data types will be mapped.
+    */
+   private static void buildSQLTypeNameMap( Connection c ) {
+
+      try {
+         DatabaseMetaData dmd = c.getMetaData();
+         ResultSet rs = dmd.getTypeInfo();
+
+         while ( rs.next() ) {
+            typeNameMap.putIfAbsent( new Integer( rs.getInt( "DATA_TYPE" ) ), rs.getString( "TYPE_NAME" ) );
+         }
+      }
+      catch ( java.sql.SQLException e ) {
+         System.err.println( e.getMessage() );
+         e.printStackTrace();
+      }
+
+   }
+
+   /**
+    * Populates the ConcurrentMap which correlates Java classes to the data types in java.sql.Types.
+    */
+   private static void buildJavaClassTypeMap() {
+
+      typeClassMap.put( boolean.class, new Integer( java.sql.Types.BOOLEAN ));
+      typeClassMap.put( Boolean.class, new Integer( java.sql.Types.BOOLEAN ));
+      typeClassMap.put( byte.class, new Integer( java.sql.Types.VARBINARY ));
+      typeClassMap.put( Byte.class, new Integer( java.sql.Types.VARBINARY ));
+      typeClassMap.put( short.class, new Integer( java.sql.Types.SMALLINT ));
+      typeClassMap.put( Short.class, new Integer( java.sql.Types.SMALLINT ));
+      typeClassMap.put( int.class, new Integer( java.sql.Types.INTEGER ));
+      typeClassMap.put( Integer.class, new Integer( java.sql.Types.INTEGER ));
+      typeClassMap.put( long.class, new Integer( java.sql.Types.BIGINT ));
+      typeClassMap.put( Long.class, new Integer( java.sql.Types.BIGINT ));
+      typeClassMap.put( float.class, new Integer( java.sql.Types.FLOAT ));
+      typeClassMap.put( Float.class, new Integer( java.sql.Types.FLOAT ));
+      typeClassMap.put( double.class, new Integer( java.sql.Types.DOUBLE ));
+      typeClassMap.put( Double.class, new Integer( java.sql.Types.DOUBLE ));
+      typeClassMap.put( BigDecimal.class, new Integer( java.sql.Types.NUMERIC ));
+      typeClassMap.put( String.class, new Integer( java.sql.Types.VARCHAR ));
+      typeClassMap.put( Character.class, new Integer( java.sql.Types.CHAR ));
+      typeClassMap.put( char.class, new Integer( java.sql.Types.CHAR ));
+      typeClassMap.put( byte[].class, new Integer( java.sql.Types.VARBINARY ));
+      typeClassMap.put( Byte[].class, new Integer( java.sql.Types.VARBINARY ));
+      typeClassMap.put( char[].class, new Integer( java.sql.Types.VARCHAR ));
+      typeClassMap.put( Character[].class, new Integer( java.sql.Types.VARCHAR ));
+      typeClassMap.put( java.util.Date.class, new Integer( java.sql.Types.TIMESTAMP ));
+      typeClassMap.put( java.sql.Date.class, new Integer( java.sql.Types.DATE ));
+      typeClassMap.put( java.sql.Time.class, new Integer( java.sql.Types.TIME ));
+      typeClassMap.put( java.sql.Timestamp.class, new Integer( java.sql.Types.TIMESTAMP ));
+//      typeClassMap.put( java.io.InputStream.class, null );
+//      typeClassMap.put( java.io.Reader.class, null );
+      typeClassMap.put( java.sql.Clob.class, new Integer( java.sql.Types.CLOB ));
+      typeClassMap.put( java.sql.Blob.class, new Integer( java.sql.Types.BLOB ));
+      typeClassMap.put( Object.class, new Integer( java.sql.Types.JAVA_OBJECT ));
+
+   }
+
+   /**
+    * Retrieves a ConcurrentMap that correlates Java Classes to SQL data types in {@link java.sql.Types}.
+    * Note that this mapping is somewhat arbitrary and represents <b>a way</b>, but <b>not necessarily
+    * the best way</b> to store these values in a database.
+    *
+    * TODO: add list of mappings
+    *
+    * @return A Map object who's keys are Java Classes and whose values are Integer objects initialized
+    * to the values in {@link java.sql.Types}.
+    */
+   public static ConcurrentMap<Class, Integer> getClassToTypeNumMap() {
+      return typeClassMap;
+   }
+
+   /**
+    * The preferred way to add a new data type to the list of data types which Persist understands and supports.
+    * @param class The class signature of the new data type.  (use <Object name>.class)
+    * @param typeNum The SQL data type number to map the custom type to.  (See {@link java.sql.Types})
+    */
+   public void addSupportedDataType( Class cl, int typeNum ) {
+       getClassToTypeNumMap().put( cl, typeNum);
+   }
+
+   /**
+    * Override the default Java Class to SQL data type mapping.  This this replaces the default (or previously
+    * overridden) map entirely.  The old map is discarded.
+    *
+    * @param classToTypeMap A ConcurrentMap which maps Java classes to Integer objects whose values are
+    * those in {@link java.sql.Types}.
+    */
+   public void setClassToTypeMap( ConcurrentMap<Class, Integer> classToTypeMap ) {
+      typeClassMap = classToTypeMap;
+   }
+
+   public static String getTypeNameFromClass( Class c ) {
+      return typeNameMap.get(getClassToTypeNumMap().get( c ));
+   }
+
+   /**
+    * Package private utility medthod to format a ResultSet as XML.
+    * @param rs ResultSet to format, it is not modified except that, when the method returns, the cursor position
+    *           will be set using the "beforeFirst()" method.
+    * @return A nicely formatted, multiline string in XML format.
+    * @throws java.sql.SQLException
+    */
+   static String toXML(final ResultSet rs) throws SQLException {
+
+        // reset the result set
+        rs.beforeFirst();
+
+        ResultSetMetaData rsmd = rs.getMetaData();
+        int colCount = rsmd.getColumnCount();
+        StringBuffer xml = new StringBuffer();
+        xml.append("<Results>\n");
+
+        while (rs.next())
+        {
+            xml.append("  <Row>\n");
+
+            for (int i = 1; i <= colCount; i++)
+            {
+               String columnName = rsmd.getColumnName( i );
+               Object value = rs.getObject( i );
+               if ( rs.wasNull() )
+                  continue;
+               xml.append( "    <" + columnName + ">" );
+               xml.append( value.toString().trim() );
+               xml.append( "</" + columnName + ">\n" );
+            }
+            xml.append(" </Row>\n");
+        }
+
+        // reset the result set
+        rs.beforeFirst();
+
+        xml.append("</Results>\n");
+
+        return xml.toString();
+    }
+
 
 }
