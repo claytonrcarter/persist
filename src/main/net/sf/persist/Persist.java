@@ -215,8 +215,6 @@ public final class Persist {
 	 */
    public Mapping getMapping(final Class objectClass, final String tableName, final boolean useGuessedNames ) {
 
-//        System.out.println( "Persist: getting mapping for [" + objectClass.getName() + "] objects from table [" + tableName + "]" );
-
 		if (cacheName == null) {
 			cacheName = DEFAULT_CACHE;
 		}
@@ -229,7 +227,13 @@ public final class Persist {
 
 		final ConcurrentMap<Class, Mapping> mappingCache = mappingCaches.get(cacheName);
 
-		if (!mappingCache.containsKey(objectClass)) {
+                // if the cache doesn't contain any entries for this object class
+                // OR it does, but the entry is for a different table
+                // then put a new entry into the cache for this object type
+                // TODO cache should be able to hold multiple entries for different tables mapped to the same type of object
+		if ( ! mappingCache.containsKey(objectClass) ||
+                     ( mappingCache.get(objectClass) instanceof TableMapping &&
+                       ! ((TableMapping) mappingCache.get(objectClass) ).getTableName().equals( tableName ) )) {
 			try {
 				// more than one map may end up being inserted here for the same
 				// objectClass, but this is not problematic
@@ -1037,7 +1041,15 @@ public final class Persist {
 		// for beans
 		else {
 
-			final Mapping mapping = getMapping(objectClass);
+			Mapping mapping;
+
+                        // if this call to getMapping fails, we can try again by explicitly
+                        // setting the table name from what the result set says it is
+                        try {
+                          mapping = getMapping(objectClass );
+                        } catch ( PersistException e ) {
+                          mapping = getMapping( objectClass, resultSetMetaData.getTableName(1) );
+                        }
 
 			try {
 				ret = objectClass.newInstance();
@@ -1242,13 +1254,17 @@ public final class Persist {
 
    // TODO add javadoc
    public int create(final String tableName, final Object o) {
-
-      System.out.println( "Creating table [" + tableName + "] to hold objects of type [" + o.getClass().getName() + "]" );
+     
+	if (Log.isDebugEnabled(Log.ENGINE)) {
+		Log.debug(Log.ENGINE, "Creating table [" + tableName + "] to hold objects of type [" + o.getClass().getName() + "]" );
+	}
 
       final TableMapping mapping;
       mapping = getTableMapping( o.getClass(), tableName, USE_GUESSED_NAMES, "create()" );
 
       final String sql = mapping.getCreateSql();
+
+      System.out.println("PERSIST " + sql );
 
       int ret = executeUpdate(sql, (Object[]) null );
 
